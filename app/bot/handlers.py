@@ -7,7 +7,17 @@ from telegram import Update
 from telegram.ext import Application, BaseHandler, CommandHandler, ContextTypes
 
 from app.config import load_settings
-from app.db.database import add_city, delete_city, is_push_enabled, list_cities, set_push_enabled
+from app.db.database import (
+    DEFAULT_PUSH_HOUR,
+    DEFAULT_PUSH_MINUTE,
+    add_city,
+    delete_city,
+    get_push_time,
+    is_push_enabled,
+    list_cities,
+    set_push_enabled,
+    set_push_time,
+)
 from app.services.weather_service import CityWeatherResult, WeatherService, WeatherServiceError
 
 
@@ -15,16 +25,16 @@ logger = logging.getLogger(__name__)
 
 UNAUTHORIZED_TEXT = "无权限使用该命令。"
 EMPTY_CITIES_TEXT = "当前没有已保存城市，请先使用 /add 添加城市。"
+SETTIME_USAGE_TEXT = "用法：/settime HH:MM，例如 /settime 08:30"
 PUSH_ENABLED_TEXT = "已开启每日自动天气推送。"
 PUSH_DISABLED_TEXT = "已关闭每日自动天气推送。"
 PUSH_ALREADY_ENABLED_TEXT = "自动天气推送已开启。"
 PUSH_ALREADY_DISABLED_TEXT = "自动天气推送已关闭。"
 DAILY_PUSH_JOB_NAME = "daily_weather_push"
-DAILY_PUSH_HOUR = 8
-DAILY_PUSH_MINUTE = 0
 DEFAULT_FALLBACK_TIMEZONE = "UTC"
+TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
-HELP_TEXT = """
+HELP_TEXT = f"""
 Telegram Weather Bot
 
 当前已支持：
@@ -35,8 +45,10 @@ Telegram Weather Bot
 - /list
 - /start = 开启每日自动天气推送
 - /stop = 关闭每日自动天气推送
+- /settime HH:MM = 设置每日自动推送时间，例如 /settime 08:30
 
-当前机器人仅服务单用户，只有配置的 TELEGRAM_USER_ID 可以使用 /check、/add、/delete、/list、/start、/stop。
+默认推送时间为 {DEFAULT_PUSH_HOUR:02d}:{DEFAULT_PUSH_MINUTE:02d}，可以通过 /settime HH:MM 修改。
+当前机器人仅服务单用户，只有配置的 TELEGRAM_USER_ID 可以使用 /check、/add、/delete、/list、/start、/stop、/settime。
 """.strip()
 
 
@@ -141,6 +153,29 @@ async def stop_push_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await reply_text(update, PUSH_DISABLED_TEXT)
 
 
+async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+
+    if len(context.args) != 1:
+        await reply_text(update, SETTIME_USAGE_TEXT)
+        return
+
+    parsed = parse_push_time(context.args[0])
+    if not parsed:
+        await reply_text(update, SETTIME_USAGE_TEXT)
+        return
+
+    hour, minute = parsed
+    settings = load_settings()
+    set_push_time(settings.telegram_user_id, hour, minute)
+
+    if is_push_enabled(settings.telegram_user_id):
+        schedule_daily_push(context.application)
+
+    await reply_text(update, f"已将每日自动推送时间设置为 {hour:02d}:{minute:02d}")
+
+
 async def daily_push_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = load_settings()
 
@@ -175,6 +210,13 @@ async def reply_text(update: Update, text: str) -> None:
 
 def normalize_city_name(city_name: str) -> str:
     return re.sub(r"\s+", " ", city_name).strip()
+
+
+def parse_push_time(value: str) -> tuple[int, int] | None:
+    match = TIME_PATTERN.fullmatch(value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def build_weather_text() -> str | None:
@@ -251,8 +293,9 @@ def format_percentage(value: float | int | None) -> str:
     return f"{round(value)}%"
 
 
-def get_push_time() -> time:
+def get_scheduled_push_time() -> time:
     settings = load_settings()
+    hour, minute = get_push_time(settings.telegram_user_id)
 
     try:
         timezone = ZoneInfo(settings.default_timezone)
@@ -264,7 +307,7 @@ def get_push_time() -> time:
         )
         timezone = ZoneInfo(DEFAULT_FALLBACK_TIMEZONE)
 
-    return time(hour=DAILY_PUSH_HOUR, minute=DAILY_PUSH_MINUTE, tzinfo=timezone)
+    return time(hour=hour, minute=minute, tzinfo=timezone)
 
 
 def schedule_daily_push(application: Application) -> None:
@@ -278,7 +321,7 @@ def schedule_daily_push(application: Application) -> None:
 
     job_queue.run_daily(
         daily_push_callback,
-        time=get_push_time(),
+        time=get_scheduled_push_time(),
         name=DAILY_PUSH_JOB_NAME,
         chat_id=int(settings.telegram_user_id),
         user_id=int(settings.telegram_user_id),
@@ -314,4 +357,5 @@ def get_handlers() -> list[BaseHandler]:
         CommandHandler("list", list_command),
         CommandHandler("start", start_push_command),
         CommandHandler("stop", stop_push_command),
+        CommandHandler("settime", settime_command),
     ]
