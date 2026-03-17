@@ -5,8 +5,6 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 
-FIXED_CITIES = ["北京", "上海"]
-
 WEATHER_CODE_DESCRIPTIONS = {
     0: "晴",
     1: "晴间多云",
@@ -52,15 +50,15 @@ class CityWeatherResult:
 
 
 class WeatherService:
-    """Fetch current weather and 7-day forecast for fixed cities."""
+    """Fetch current weather and 7-day forecast for stored cities."""
 
     geocoding_url = "https://geocoding-api.open-meteo.com/v1/search"
     forecast_url = "https://api.open-meteo.com/v1/forecast"
 
-    def get_fixed_cities_weather(self, timezone: str) -> list[CityWeatherResult]:
+    def get_cities_weather(self, cities: list[str], timezone: str) -> list[CityWeatherResult]:
         results: list[CityWeatherResult] = []
 
-        for city in FIXED_CITIES:
+        for city in cities:
             try:
                 results.append(self.get_city_weather(city=city, timezone=timezone))
             except WeatherServiceError as exc:
