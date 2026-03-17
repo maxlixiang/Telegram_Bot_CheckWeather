@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  telegram-weather-bot:
+    build: .
+    container_name: telegram-weather-bot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
