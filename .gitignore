@@ -1,4 +1,4 @@
-__pycache__/
+﻿__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
@@ -17,6 +17,8 @@ env/
 
 .idea/
 .vscode/
+
+.git/
 
 dist/
 build/
