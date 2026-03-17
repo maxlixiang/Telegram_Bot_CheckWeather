@@ -1,4 +1,5 @@
-﻿from pathlib import Path
+﻿from dataclasses import dataclass
+from pathlib import Path
 import logging
 import sqlite3
 
@@ -9,6 +10,16 @@ DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "weather.db"
 DEFAULT_PUSH_HOUR = 8
 DEFAULT_PUSH_MINUTE = 0
+
+
+@dataclass(slots=True)
+class StoredCity:
+    id: int
+    city_name: str
+    display_name: str | None
+    latitude: float | None
+    longitude: float | None
+    normalized_key: str | None
 
 
 def init_storage() -> None:
@@ -35,17 +46,28 @@ def init_storage() -> None:
             """
         )
 
-        columns = {
+        city_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(cities)").fetchall()
+        }
+        if "display_name" not in city_columns:
+            conn.execute("ALTER TABLE cities ADD COLUMN display_name TEXT")
+        if "latitude" not in city_columns:
+            conn.execute("ALTER TABLE cities ADD COLUMN latitude REAL")
+        if "longitude" not in city_columns:
+            conn.execute("ALTER TABLE cities ADD COLUMN longitude REAL")
+        if "normalized_key" not in city_columns:
+            conn.execute("ALTER TABLE cities ADD COLUMN normalized_key TEXT")
+
+        settings_columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(user_settings)").fetchall()
         }
-
-        if "push_hour" not in columns:
+        if "push_hour" not in settings_columns:
             conn.execute(
                 f"ALTER TABLE user_settings ADD COLUMN push_hour INTEGER NOT NULL DEFAULT {DEFAULT_PUSH_HOUR}"
             )
-
-        if "push_minute" not in columns:
+        if "push_minute" not in settings_columns:
             conn.execute(
                 f"ALTER TABLE user_settings ADD COLUMN push_minute INTEGER NOT NULL DEFAULT {DEFAULT_PUSH_MINUTE}"
             )
@@ -53,19 +75,63 @@ def init_storage() -> None:
         conn.commit()
 
 
-def add_city(user_id: str, city_name: str) -> bool:
+def add_city_record(
+    user_id: str,
+    city_name: str,
+    display_name: str,
+    latitude: float,
+    longitude: float,
+    normalized_key: str,
+) -> None:
     init_storage()
 
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO cities (user_id, city_name) VALUES (?, ?)",
-                (user_id, city_name),
-            )
-            conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO cities (user_id, city_name, display_name, latitude, longitude, normalized_key)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, city_name, display_name, latitude, longitude, normalized_key),
+        )
+        conn.commit()
+
+
+def find_city_by_normalized_key(user_id: str, normalized_key: str) -> StoredCity | None:
+    init_storage()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT id, city_name, display_name, latitude, longitude, normalized_key
+            FROM cities
+            WHERE user_id = ? AND normalized_key = ?
+            LIMIT 1
+            """,
+            (user_id, normalized_key),
+        ).fetchone()
+
+    return _row_to_stored_city(row)
+
+
+def update_city_metadata(
+    city_id: int,
+    display_name: str,
+    latitude: float,
+    longitude: float,
+    normalized_key: str,
+) -> None:
+    init_storage()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE cities
+            SET display_name = ?, latitude = ?, longitude = ?, normalized_key = ?
+            WHERE id = ?
+            """,
+            (display_name, latitude, longitude, normalized_key, city_id),
+        )
+        conn.commit()
 
 
 def delete_city(user_id: str, city_name: str) -> bool:
@@ -73,24 +139,32 @@ def delete_city(user_id: str, city_name: str) -> bool:
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
-            "DELETE FROM cities WHERE user_id = ? AND city_name = ?",
-            (user_id, city_name),
+            """
+            DELETE FROM cities
+            WHERE user_id = ? AND (city_name = ? OR display_name = ?)
+            """,
+            (user_id, city_name, city_name),
         )
         conn.commit()
 
     return cursor.rowcount > 0
 
 
-def list_cities(user_id: str) -> list[str]:
+def list_cities(user_id: str) -> list[StoredCity]:
     init_storage()
 
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT city_name FROM cities WHERE user_id = ? ORDER BY id ASC",
+            """
+            SELECT id, city_name, display_name, latitude, longitude, normalized_key
+            FROM cities
+            WHERE user_id = ?
+            ORDER BY id ASC
+            """,
             (user_id,),
         ).fetchall()
 
-    return [row[0] for row in rows]
+    return [_row_to_stored_city(row) for row in rows]
 
 
 def is_push_enabled(user_id: str) -> bool:
@@ -165,3 +239,17 @@ def set_push_time(user_id: str, hour: int, minute: int) -> None:
             (user_id, hour, minute),
         )
         conn.commit()
+
+
+def _row_to_stored_city(row: sqlite3.Row | tuple | None) -> StoredCity | None:
+    if row is None:
+        return None
+
+    return StoredCity(
+        id=row[0],
+        city_name=row[1],
+        display_name=row[2],
+        latitude=row[3],
+        longitude=row[4],
+        normalized_key=row[5],
+    )

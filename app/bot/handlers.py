@@ -10,15 +10,23 @@ from app.config import load_settings
 from app.db.database import (
     DEFAULT_PUSH_HOUR,
     DEFAULT_PUSH_MINUTE,
-    add_city,
+    StoredCity,
+    add_city_record,
     delete_city,
+    find_city_by_normalized_key,
     get_push_time,
     is_push_enabled,
     list_cities,
     set_push_enabled,
     set_push_time,
+    update_city_metadata,
 )
-from app.services.weather_service import CityWeatherResult, WeatherService, WeatherServiceError
+from app.services.weather_service import (
+    CityNotFoundError,
+    CityWeatherResult,
+    WeatherService,
+    WeatherServiceError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -84,11 +92,31 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     settings = load_settings()
-    if add_city(settings.telegram_user_id, city_name):
-        await reply_text(update, f"已添加城市：{city_name}")
+    service = WeatherService()
+
+    try:
+        resolved = service.resolve_city(city_name)
+    except CityNotFoundError:
+        await reply_text(update, f"未找到城市：{city_name}，请尝试更具体的名称。")
+        return
+    except WeatherServiceError:
+        await reply_text(update, "城市查询服务暂时不可用，请稍后再试。")
         return
 
-    await reply_text(update, f"城市已存在：{city_name}")
+    existing = find_city_by_normalized_key(settings.telegram_user_id, resolved.normalized_key)
+    if existing:
+        await reply_text(update, f"城市已存在：{existing.display_name or existing.city_name}")
+        return
+
+    add_city_record(
+        user_id=settings.telegram_user_id,
+        city_name=city_name,
+        display_name=resolved.display_name,
+        latitude=resolved.latitude,
+        longitude=resolved.longitude,
+        normalized_key=resolved.normalized_key,
+    )
+    await reply_text(update, f"已添加城市：{resolved.display_name}")
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -119,7 +147,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     lines = ["当前城市列表："]
-    lines.extend(f"- {city}" for city in cities)
+    lines.extend(f"- {city.display_name or city.city_name}" for city in cities)
     await reply_text(update, "\n".join(lines))
 
 
@@ -226,12 +254,61 @@ def build_weather_text() -> str | None:
         return None
 
     service = WeatherService()
-    city_reports = service.get_cities_weather(cities=cities, timezone=settings.default_timezone)
-    return format_check_message(city_reports)
+    reports: list[CityWeatherResult] = []
+
+    for city in cities:
+        try:
+            weather_target = prepare_weather_city(service, city)
+            reports.append(
+                service.get_weather_for_location(
+                    city_label=weather_target.display_name or weather_target.city_name,
+                    latitude=weather_target.latitude,
+                    longitude=weather_target.longitude,
+                    timezone=settings.default_timezone,
+                )
+            )
+        except CityNotFoundError:
+            reports.append(
+                CityWeatherResult(
+                    city=city.display_name or city.city_name,
+                    error="未找到城市位置信息。",
+                )
+            )
+        except WeatherServiceError as exc:
+            reports.append(
+                CityWeatherResult(
+                    city=city.display_name or city.city_name,
+                    error=str(exc),
+                )
+            )
+
+    if reports and all(report.error for report in reports):
+        raise WeatherServiceError("天气服务暂时不可用，请稍后再试。")
+
+    return format_check_message(reports)
+
+
+def prepare_weather_city(service: WeatherService, city: StoredCity) -> StoredCity:
+    if city.latitude is not None and city.longitude is not None:
+        return city
+
+    resolved = service.resolve_city(city.city_name)
+    update_city_metadata(
+        city_id=city.id,
+        display_name=resolved.display_name,
+        latitude=resolved.latitude,
+        longitude=resolved.longitude,
+        normalized_key=resolved.normalized_key,
+    )
+    city.display_name = resolved.display_name
+    city.latitude = resolved.latitude
+    city.longitude = resolved.longitude
+    city.normalized_key = resolved.normalized_key
+    return city
 
 
 def format_check_message(city_reports: list[CityWeatherResult]) -> str:
-    sections = ["当前城市天气"]
+    sections = ["🌦️ 天气简报"]
 
     for report in city_reports:
         sections.append(format_city_weather(report))
@@ -241,29 +318,28 @@ def format_check_message(city_reports: list[CityWeatherResult]) -> str:
 
 def format_city_weather(report: CityWeatherResult) -> str:
     if report.error:
-        return f"{report.city}\n查询失败：{report.error}"
+        return f"📍 {report.city}\n⚠️ 查询失败：{report.error}"
 
     current = report.current or {}
     daily = report.daily or []
 
     lines = [
-        report.city,
+        f"📍 {report.city}",
         (
-            "当前天气："
-            f"{current.get('weather', '未知')}，"
-            f"{format_temperature(current.get('temperature'))}，"
-            f"体感 {format_temperature(current.get('apparent_temperature'))}，"
-            f"风速 {format_wind_speed(current.get('wind_speed'))}"
+            f"{current.get('weather_emoji', '❓')} 当前：{current.get('weather', '未知')}  "
+            f"{format_temperature(current.get('temperature'))}"
+            f"（体感 {format_temperature(current.get('apparent_temperature'))}）"
         ),
-        "未来 7 天：",
+        f"💨 风速：{format_wind_speed(current.get('wind_speed'))}",
+        "📅 未来 7 天",
     ]
 
     for item in daily:
         lines.append(
-            f"{format_date(item.get('date'))} "
-            f"{item.get('weather', '未知')} "
-            f"{format_temperature(item.get('temp_min'))}~{format_temperature(item.get('temp_max'))} "
-            f"降水概率 {format_percentage(item.get('precipitation_probability'))}"
+            f"• {format_date(item.get('date'))} "
+            f"{item.get('weather_emoji', '❓')} {item.get('weather', '未知')}  "
+            f"{format_temp_range(item.get('temp_min'), item.get('temp_max'))}  "
+            f"☔ {format_percentage(item.get('precipitation_probability'))}"
         )
 
     return "\n".join(lines)
@@ -279,6 +355,10 @@ def format_temperature(value: float | int | None) -> str:
     if value is None:
         return "--"
     return f"{round(value)}°C"
+
+
+def format_temp_range(temp_min: float | int | None, temp_max: float | int | None) -> str:
+    return f"{format_temperature(temp_min)} ~ {format_temperature(temp_max)}"
 
 
 def format_wind_speed(value: float | int | None) -> str:
