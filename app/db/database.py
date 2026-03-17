@@ -21,6 +21,14 @@ def init_storage() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id TEXT PRIMARY KEY,
+                push_enabled INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         conn.commit()
 
 
@@ -62,3 +70,30 @@ def list_cities(user_id: str) -> list[str]:
         ).fetchall()
 
     return [row[0] for row in rows]
+
+
+def is_push_enabled(user_id: str) -> bool:
+    init_storage()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT push_enabled FROM user_settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+    return bool(row[0]) if row else False
+
+
+def set_push_enabled(user_id: str, enabled: bool) -> None:
+    init_storage()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO user_settings (user_id, push_enabled)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET push_enabled = excluded.push_enabled
+            """,
+            (user_id, int(enabled)),
+        )
+        conn.commit()

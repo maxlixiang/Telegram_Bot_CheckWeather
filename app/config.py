@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+﻿from dataclasses import dataclass
 import os
 
 
@@ -22,3 +22,5 @@ def load_settings() -> Settings:
 def validate_settings(settings: Settings) -> None:
     if not settings.telegram_bot_token:
         raise ValueError("Missing required environment variable: TELEGRAM_BOT_TOKEN")
+    if not settings.telegram_user_id:
+        raise ValueError("Missing required environment variable: TELEGRAM_USER_ID")

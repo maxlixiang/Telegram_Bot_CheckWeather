@@ -9,24 +9,32 @@
 - 完成环境变量配置读取
 - 完成 bot 最小启动流程
 - 启动时自动准备 `data/` 目录和 SQLite 数据库
-- 已支持 `/help`、`/check`、`/add`、`/delete`、`/list`
+- 已支持 `/help`、`/check`、`/add`、`/delete`、`/list`、`/start`、`/stop`
 - 城市列表已接入 SQLite 持久化存储
 - `/check` 现在从数据库读取城市列表并返回当前天气和未来 7 天概览
+- `/start` 可开启每日自动天气推送
+- `/stop` 可关闭每日自动天气推送
+- 自动推送开关状态会持久化到 SQLite，并在程序重启后恢复
 - 对天气 API 请求失败增加基础错误处理
 - 当前机器人仅服务单用户
 
 ## 当前阶段未实现
 当前阶段尚未实现：
-- 自动天气推送
-- `/start`、`/stop`
+- 自定义推送时间
 - 多用户系统和复杂权限模型
+- webhook 与后台管理
 
-## 第三阶段说明
-- 当前只允许配置的 `TELEGRAM_USER_ID` 使用 `/check`、`/add`、`/delete`、`/list`
+## 第四阶段说明
+- `/start = 开启每日自动天气推送`
+- `/stop = 关闭每日自动天气推送`
+- 自动推送固定为每天 `08:00`
+- 自动推送内容直接复用 `/check` 的天气文本构造逻辑
+- 当前只允许配置的 `TELEGRAM_USER_ID` 使用 `/check`、`/add`、`/delete`、`/list`、`/start`、`/stop`
 - 未授权用户调用受限命令时，会收到：`无权限使用该命令。`
 - 城市名会做最小规范化后再入库：去掉首尾空格，并将连续空白压缩为单个空格
 - SQLite 数据库存储在 `data/weather.db`
-- 城市列表按添加顺序返回
+- 推送开关持久化存储在 `user_settings` 表中
+- 启动时如果检测到已开启推送，会自动恢复每日任务
 - 天气数据继续使用 Open-Meteo API
 
 ## 项目目录结构
@@ -63,7 +71,7 @@
 - `TELEGRAM_BOT_TOKEN`: 必填，Telegram 机器人令牌
 - `TELEGRAM_USER_ID`: 必填，当前唯一允许操作机器人的 Telegram 用户 ID
 - `WEATHER_API_KEY`: 当前阶段保留但未实际使用，后续如切换天气服务可接入
-- `DEFAULT_TIMEZONE`: 默认时区
+- `DEFAULT_TIMEZONE`: 默认时区，用于每日推送时间解释；如果无效会回退到 `UTC`
 
 ## 命令说明
 - `/help`: 查看帮助
@@ -71,23 +79,26 @@
 - `/delete 城市名`: 删除已保存城市
 - `/list`: 查看当前已保存城市列表
 - `/check`: 查询当前已保存城市的天气
+- `/start`: 开启每日自动天气推送
+- `/stop`: 关闭每日自动天气推送
 
 ## 本地运行方式
 1. 使用 Python 3.11 创建虚拟环境。
 2. 安装依赖：`pip install -r requirements.txt`
 3. 复制环境变量模板：将 `.env.example` 另存为 `.env`
-4. 在 `.env` 中填写 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_USER_ID`
+4. 在 `.env` 中填写 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_USER_ID` 和 `DEFAULT_TIMEZONE`
 5. 启动项目：`python -m app.main`
 6. 在 Telegram 中先发送 `/add 北京`
-7. 再发送 `/list` 和 `/check` 验证 SQLite 和天气查询链路
+7. 再发送 `/start` 开启每日自动推送
+8. 可通过 `/stop` 关闭自动推送
 
 ## Docker 运行方式
 1. 将 `.env.example` 另存为 `.env`
 2. 填写环境变量
 3. 构建并启动：`docker compose up --build`
-4. 在 Telegram 中使用 `/add`、`/list`、`/check`
+4. 在 Telegram 中使用 `/add`、`/check`、`/start`、`/stop`
 
 ## 后续开发计划
-- 增加自动天气推送
-- 引入 `/start`、`/stop`
+- 支持自定义推送时间
 - 扩展到多用户场景
+- 引入更完善的推送管理能力

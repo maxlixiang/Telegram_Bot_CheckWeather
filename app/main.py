@@ -1,9 +1,9 @@
-import logging
+﻿import logging
 
 from dotenv import load_dotenv
 from telegram.ext import Application
 
-from app.bot.handlers import get_handlers
+from app.bot.handlers import get_handlers, restore_daily_push_job
 from app.config import load_settings, validate_settings
 from app.db.database import init_storage
 
@@ -25,6 +25,8 @@ def main() -> None:
 
     for handler in get_handlers():
         application.add_handler(handler)
+
+    restore_daily_push_job(application)
 
     logging.info("Bot is starting...")
     application.run_polling()

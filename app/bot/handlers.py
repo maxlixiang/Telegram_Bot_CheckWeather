@@ -1,16 +1,28 @@
-﻿from datetime import datetime
+﻿from datetime import datetime, time
+import logging
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update
-from telegram.ext import BaseHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, BaseHandler, CommandHandler, ContextTypes
 
 from app.config import load_settings
-from app.db.database import add_city, delete_city, list_cities
+from app.db.database import add_city, delete_city, is_push_enabled, list_cities, set_push_enabled
 from app.services.weather_service import CityWeatherResult, WeatherService, WeatherServiceError
 
 
+logger = logging.getLogger(__name__)
+
 UNAUTHORIZED_TEXT = "无权限使用该命令。"
 EMPTY_CITIES_TEXT = "当前没有已保存城市，请先使用 /add 添加城市。"
+PUSH_ENABLED_TEXT = "已开启每日自动天气推送。"
+PUSH_DISABLED_TEXT = "已关闭每日自动天气推送。"
+PUSH_ALREADY_ENABLED_TEXT = "自动天气推送已开启。"
+PUSH_ALREADY_DISABLED_TEXT = "自动天气推送已关闭。"
+DAILY_PUSH_JOB_NAME = "daily_weather_push"
+DAILY_PUSH_HOUR = 8
+DAILY_PUSH_MINUTE = 0
+DEFAULT_FALLBACK_TIMEZONE = "UTC"
 
 HELP_TEXT = """
 Telegram Weather Bot
@@ -21,12 +33,10 @@ Telegram Weather Bot
 - /add 城市名
 - /delete 城市名
 - /list
+- /start = 开启每日自动天气推送
+- /stop = 关闭每日自动天气推送
 
-未实现：
-- /start
-- /stop
-
-当前机器人仅服务单用户，只有配置的 TELEGRAM_USER_ID 可以使用 /check、/add、/delete、/list。
+当前机器人仅服务单用户，只有配置的 TELEGRAM_USER_ID 可以使用 /check、/add、/delete、/list、/start、/stop。
 """.strip()
 
 
@@ -39,21 +49,17 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await ensure_authorized(update):
         return
 
-    settings = load_settings()
-    cities = list_cities(settings.telegram_user_id)
-    if not cities:
-        await reply_text(update, EMPTY_CITIES_TEXT)
-        return
-
-    service = WeatherService()
-
     try:
-        city_reports = service.get_cities_weather(cities=cities, timezone=settings.default_timezone)
+        message = build_weather_text()
     except WeatherServiceError:
         await reply_text(update, "天气服务暂时不可用，请稍后再试。")
         return
 
-    await reply_text(update, format_check_message(city_reports))
+    if not message:
+        await reply_text(update, EMPTY_CITIES_TEXT)
+        return
+
+    await reply_text(update, message)
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,6 +111,52 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await reply_text(update, "\n".join(lines))
 
 
+async def start_push_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+
+    settings = load_settings()
+    already_enabled = is_push_enabled(settings.telegram_user_id)
+    set_push_enabled(settings.telegram_user_id, True)
+    schedule_daily_push(context.application)
+
+    if already_enabled:
+        await reply_text(update, PUSH_ALREADY_ENABLED_TEXT)
+        return
+
+    await reply_text(update, PUSH_ENABLED_TEXT)
+
+
+async def stop_push_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+
+    settings = load_settings()
+    if not is_push_enabled(settings.telegram_user_id):
+        await reply_text(update, PUSH_ALREADY_DISABLED_TEXT)
+        return
+
+    set_push_enabled(settings.telegram_user_id, False)
+    remove_daily_push_job(context.application)
+    await reply_text(update, PUSH_DISABLED_TEXT)
+
+
+async def daily_push_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = load_settings()
+
+    try:
+        message = build_weather_text()
+    except WeatherServiceError:
+        logger.warning("Daily weather push failed because weather service is unavailable.")
+        return
+
+    if not message:
+        logger.info("Daily weather push skipped because no cities are saved.")
+        return
+
+    await context.bot.send_message(chat_id=int(settings.telegram_user_id), text=message)
+
+
 async def ensure_authorized(update: Update) -> bool:
     settings = load_settings()
     user = update.effective_user
@@ -123,6 +175,17 @@ async def reply_text(update: Update, text: str) -> None:
 
 def normalize_city_name(city_name: str) -> str:
     return re.sub(r"\s+", " ", city_name).strip()
+
+
+def build_weather_text() -> str | None:
+    settings = load_settings()
+    cities = list_cities(settings.telegram_user_id)
+    if not cities:
+        return None
+
+    service = WeatherService()
+    city_reports = service.get_cities_weather(cities=cities, timezone=settings.default_timezone)
+    return format_check_message(city_reports)
 
 
 def format_check_message(city_reports: list[CityWeatherResult]) -> str:
@@ -188,6 +251,60 @@ def format_percentage(value: float | int | None) -> str:
     return f"{round(value)}%"
 
 
+def get_push_time() -> time:
+    settings = load_settings()
+
+    try:
+        timezone = ZoneInfo(settings.default_timezone)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "Invalid timezone '%s'. Falling back to %s.",
+            settings.default_timezone,
+            DEFAULT_FALLBACK_TIMEZONE,
+        )
+        timezone = ZoneInfo(DEFAULT_FALLBACK_TIMEZONE)
+
+    return time(hour=DAILY_PUSH_HOUR, minute=DAILY_PUSH_MINUTE, tzinfo=timezone)
+
+
+def schedule_daily_push(application: Application) -> None:
+    job_queue = application.job_queue
+    if job_queue is None:
+        logger.warning("JobQueue is not available. Daily push will not be scheduled.")
+        return
+
+    settings = load_settings()
+    remove_daily_push_job(application)
+
+    job_queue.run_daily(
+        daily_push_callback,
+        time=get_push_time(),
+        name=DAILY_PUSH_JOB_NAME,
+        chat_id=int(settings.telegram_user_id),
+        user_id=int(settings.telegram_user_id),
+    )
+
+
+def remove_daily_push_job(application: Application) -> None:
+    job_queue = application.job_queue
+    if job_queue is None:
+        return
+
+    for job in job_queue.get_jobs_by_name(DAILY_PUSH_JOB_NAME):
+        job.schedule_removal()
+
+
+def restore_daily_push_job(application: Application) -> None:
+    settings = load_settings()
+    if not settings.telegram_user_id:
+        logger.warning("TELEGRAM_USER_ID is not set. Skip restoring daily push job.")
+        return
+
+    if is_push_enabled(settings.telegram_user_id):
+        schedule_daily_push(application)
+        logger.info("Restored daily weather push job.")
+
+
 def get_handlers() -> list[BaseHandler]:
     return [
         CommandHandler("help", help_command),
@@ -195,4 +312,6 @@ def get_handlers() -> list[BaseHandler]:
         CommandHandler("add", add_command),
         CommandHandler("delete", delete_command),
         CommandHandler("list", list_command),
+        CommandHandler("start", start_push_command),
+        CommandHandler("stop", stop_push_command),
     ]
