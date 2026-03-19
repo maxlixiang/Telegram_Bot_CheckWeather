@@ -1,66 +1,40 @@
 ﻿from dataclasses import dataclass
+from datetime import datetime
 import json
+import logging
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
+from app.config import load_settings
+
+
+logger = logging.getLogger(__name__)
 
 NORMALIZED_COORD_PRECISION = 4
-
-WEATHER_CODE_DESCRIPTIONS = {
-    0: "晴",
-    1: "晴间多云",
-    2: "多云",
-    3: "阴",
-    45: "雾",
-    48: "冻雾",
-    51: "小毛雨",
-    53: "毛雨",
-    55: "强毛雨",
-    56: "冻毛雨",
-    57: "强冻毛雨",
-    61: "小雨",
-    63: "中雨",
-    65: "大雨",
-    66: "冻雨",
-    67: "强冻雨",
-    71: "小雪",
-    73: "中雪",
-    75: "大雪",
-    77: "冰粒",
-    80: "阵雨",
-    81: "强阵雨",
-    82: "暴雨",
-    85: "阵雪",
-    86: "强阵雪",
-    95: "雷暴",
-    96: "雷暴伴小冰雹",
-    99: "雷暴伴大冰雹",
-}
-
-WEATHER_CODE_EMOJIS = {
-    0: "☀️",
-    1: "🌤️",
-    2: "⛅",
-    3: "☁️",
-    45: "🌫️",
-    48: "🌫️",
-    51: "🌦️",
-    53: "🌦️",
-    55: "🌧️",
-    61: "🌧️",
-    63: "🌧️",
-    65: "🌧️",
-    71: "🌨️",
-    73: "🌨️",
-    75: "❄️",
-    80: "🌦️",
-    81: "🌧️",
-    82: "🌧️",
-    95: "⛈️",
-    96: "⛈️",
-    99: "⛈️",
-}
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+REQUEST_TIMEOUT_SECONDS = 20
+QUERY_FORECAST_DAYS = 7
+EXPECTED_DAILY_FIELDS = {"date", "weather", "temp_min", "temp_max", "precipitation_probability"}
+EXPECTED_CURRENT_FIELDS = {"weather", "temperature", "apparent_temperature", "wind_speed"}
+WEATHER_TEXT_ALIASES = [
+    (("雷暴", "雷阵雨"), ("雷暴", "⛈️")),
+    (("暴雨",), ("暴雨", "🌧️")),
+    (("大雨",), ("大雨", "🌧️")),
+    (("中雨",), ("中雨", "🌧️")),
+    (("小雨",), ("小雨", "🌧️")),
+    (("阵雨", "雷阵雨"), ("阵雨", "🌦️")),
+    (("冻雨",), ("冻雨", "🌧️")),
+    (("雨夹雪",), ("雨夹雪", "🌨️")),
+    (("小雪",), ("小雪", "🌨️")),
+    (("中雪",), ("中雪", "🌨️")),
+    (("大雪",), ("大雪", "❄️")),
+    (("阵雪",), ("阵雪", "🌨️")),
+    (("雾", "霾", "烟霾", "薄雾"), ("雾", "🌫️")),
+    (("阴",), ("阴", "☁️")),
+    (("多云",), ("多云", "⛅")),
+    (("晴间多云", "少云", "晴时多云"), ("晴间多云", "🌤️")),
+    (("晴",), ("晴", "☀️")),
+]
 
 
 class WeatherServiceError(Exception):
@@ -68,7 +42,7 @@ class WeatherServiceError(Exception):
 
 
 class CityNotFoundError(WeatherServiceError):
-    """Raised when a city cannot be resolved by geocoding."""
+    """Raised when a city cannot be resolved."""
 
 
 @dataclass(slots=True)
@@ -89,19 +63,47 @@ class CityWeatherResult:
 
 
 class WeatherService:
-    """Fetch current weather and 7-day forecast for stored cities."""
+    """Fetch current weather and 7-day forecast from DeepSeek."""
 
-    geocoding_url = "https://geocoding-api.open-meteo.com/v1/search"
-    forecast_url = "https://api.open-meteo.com/v1/forecast"
+    def __init__(self) -> None:
+        settings = load_settings()
+        self.api_key = settings.deepseek_api_key
+        self.model = settings.deepseek_model
 
     def resolve_city(self, city: str) -> ResolvedCity:
-        location = self._get_city_location(city)
+        payload = self._request_model_json(
+            user_prompt=(
+                "请识别用户输入的城市，并返回稳定的地点信息。"
+                "如果无法确定地点，请返回 {\"found\": false, \"reason\": \"...\"}。"
+                "如果可以识别，请只返回 JSON 对象，禁止输出展示文本、解释文字或 Markdown。"
+                "对象字段必须包含：found(boolean)、query_name(string)、name(string)、"
+                "display_name(string)、country_code(string)、latitude(number)、longitude(number)。"
+                "display_name 请优先使用‘城市，中国’这类中文格式。"
+                f"用户输入：{city}"
+            )
+        )
+
+        if not payload.get("found", True):
+            raise CityNotFoundError("未找到城市位置信息。")
+
+        self._require_keys(
+            payload,
+            required_keys={"query_name", "name", "display_name", "country_code", "latitude", "longitude"},
+        )
+
+        try:
+            latitude = self._to_float(payload.get("latitude"))
+            longitude = self._to_float(payload.get("longitude"))
+        except (TypeError, ValueError) as exc:
+            raise WeatherServiceError("城市查询服务返回的数据不完整，请稍后再试。") from exc
+
+        display_name = self.build_display_name(payload, city)
         return ResolvedCity(
-            query_name=city,
-            display_name=self.build_display_name(location),
-            latitude=float(location["latitude"]),
-            longitude=float(location["longitude"]),
-            normalized_key=self.build_normalized_key(location),
+            query_name=str(payload.get("query_name") or city).strip() or city,
+            display_name=display_name,
+            latitude=latitude,
+            longitude=longitude,
+            normalized_key=self.build_normalized_key(payload, latitude, longitude),
         )
 
     def get_weather_for_location(
@@ -111,136 +113,221 @@ class WeatherService:
         longitude: float,
         timezone: str,
     ) -> CityWeatherResult:
-        forecast = self._get_forecast(
-            latitude=latitude,
-            longitude=longitude,
+        payload = self._request_model_json(
+            user_prompt=(
+                "请根据给定城市和坐标，返回该城市今天到未来 6 天的天气。"
+                "只返回 JSON 对象，禁止输出最终展示文本、解释文字、Markdown 或额外字段说明。"
+                "返回字段必须严格包含：city(string)、current(object)、daily(array, 恰好 7 项)。"
+                "current 字段必须包含：weather(string)、temperature(number)、"
+                "apparent_temperature(number)、wind_speed(number)。"
+                "daily 每项必须包含：date(YYYY-MM-DD)、weather(string)、"
+                "temp_min(number)、temp_max(number)、precipitation_probability(number 0-100)。"
+                f"城市：{city_label}；纬度：{latitude}；经度：{longitude}；时区：{timezone}。"
+                "daily 要包含今天在内总共 7 天。"
+            )
+        )
+        return self._build_city_weather(city=city_label, payload=payload)
+
+    def get_weather_for_city_query(self, city: str, timezone: str) -> CityWeatherResult:
+        resolved = self.resolve_city(city)
+        report = self.get_weather_for_location(
+            city_label=resolved.display_name,
+            latitude=resolved.latitude,
+            longitude=resolved.longitude,
             timezone=timezone,
         )
-        return self._build_city_weather(city=city_label, forecast=forecast)
+        report.city = resolved.display_name
+        return report
 
-    def _get_city_location(self, city: str) -> dict:
-        payload = self._request_json(
-            self.geocoding_url,
-            {
-                "name": city,
-                "count": 1,
-                "language": "zh",
-                "format": "json",
+    def _request_model_json(self, user_prompt: str) -> dict:
+        if not self.api_key:
+            raise WeatherServiceError("未配置 DeepSeek API Key。")
+
+        body = {
+            "model": self.model,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是天气数据助手。你的所有回答都必须是合法 JSON 对象。"
+                        "禁止输出 Markdown 代码块，禁止输出给终端用户直接展示的自然语言文本。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt + "。请确保最终输出是可直接解析的 json object。",
+                },
+            ],
+        }
+        payload = json.dumps(body).encode("utf-8")
+        request = Request(
+            DEEPSEEK_API_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
             },
+            method="POST",
         )
-
-        results = payload.get("results") or []
-        if not results:
-            raise CityNotFoundError("未找到城市位置信息。")
-
-        return results[0]
-
-    def _get_forecast(self, latitude: float, longitude: float, timezone: str) -> dict:
-        return self._request_json(
-            self.forecast_url,
-            {
-                "latitude": latitude,
-                "longitude": longitude,
-                "timezone": timezone,
-                "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
-                "daily": ",".join(
-                    [
-                        "weather_code",
-                        "temperature_2m_max",
-                        "temperature_2m_min",
-                        "precipitation_probability_max",
-                    ]
-                ),
-                "forecast_days": 7,
-            },
-        )
-
-    def _request_json(self, base_url: str, params: dict) -> dict:
-        request_url = f"{base_url}?{urlencode(params)}"
 
         try:
-            with urlopen(request_url, timeout=10) as response:
-                return json.load(response)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                raw_response = json.load(response)
+        except HTTPError as exc:
+            detail = self._read_error_body(exc)
+            logger.warning("DeepSeek API HTTP error: %s", detail or exc.reason)
+            raise WeatherServiceError("天气服务请求失败，请稍后再试。") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise WeatherServiceError("天气服务请求失败，请稍后再试。") from exc
 
-    def _build_city_weather(self, city: str, forecast: dict) -> CityWeatherResult:
-        current = forecast.get("current")
-        daily = forecast.get("daily")
+        content = self._extract_message_content(raw_response)
+        try:
+            parsed = json.loads(self._strip_code_fence(content))
+        except json.JSONDecodeError as exc:
+            logger.warning("DeepSeek returned non-JSON content: %s", content)
+            raise WeatherServiceError("天气服务返回的数据无法解析，请稍后再试。") from exc
 
-        if not current or not daily:
+        if not isinstance(parsed, dict):
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+        return parsed
+
+    def _build_city_weather(self, city: str, payload: dict) -> CityWeatherResult:
+        self._require_keys(payload, required_keys={"city", "current", "daily"})
+
+        current_payload = payload.get("current")
+        daily_payload = payload.get("daily")
+
+        if not isinstance(current_payload, dict) or not isinstance(daily_payload, list):
             raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
 
-        dates = daily.get("time", [])
-        codes = daily.get("weather_code", [])
-        max_temps = daily.get("temperature_2m_max", [])
-        min_temps = daily.get("temperature_2m_min", [])
-        precipitation = daily.get("precipitation_probability_max", [])
+        self._require_keys(current_payload, required_keys=EXPECTED_CURRENT_FIELDS)
 
         daily_items: list[dict] = []
-        for index, date_value in enumerate(dates):
-            code = codes[index] if index < len(codes) else None
+        for item in daily_payload[:QUERY_FORECAST_DAYS]:
+            if not isinstance(item, dict):
+                raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+            self._require_keys(item, required_keys=EXPECTED_DAILY_FIELDS)
+            date_value = self._validate_date(item.get("date"))
+            weather_text, weather_emoji = self.normalize_weather(item.get("weather"))
             daily_items.append(
                 {
                     "date": date_value,
-                    "weather": self.describe_weather_code(code),
-                    "weather_emoji": self.get_weather_emoji(code),
-                    "temp_max": max_temps[index] if index < len(max_temps) else None,
-                    "temp_min": min_temps[index] if index < len(min_temps) else None,
-                    "precipitation_probability": (
-                        precipitation[index] if index < len(precipitation) else None
+                    "weather": weather_text,
+                    "weather_emoji": weather_emoji,
+                    "temp_max": self._required_float(item.get("temp_max")),
+                    "temp_min": self._required_float(item.get("temp_min")),
+                    "precipitation_probability": self._clamp_percentage(
+                        self._required_float(item.get("precipitation_probability"))
                     ),
                 }
             )
 
-        current_code = current.get("weather_code")
+        if len(daily_items) != QUERY_FORECAST_DAYS:
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+
+        current_weather, current_emoji = self.normalize_weather(current_payload.get("weather"))
         return CityWeatherResult(
-            city=city,
+            city=str(payload.get("city") or city).strip() or city,
             current={
-                "temperature": current.get("temperature_2m"),
-                "apparent_temperature": current.get("apparent_temperature"),
-                "weather": self.describe_weather_code(current_code),
-                "weather_emoji": self.get_weather_emoji(current_code),
-                "wind_speed": current.get("wind_speed_10m"),
+                "temperature": self._required_float(current_payload.get("temperature")),
+                "apparent_temperature": self._required_float(
+                    current_payload.get("apparent_temperature")
+                ),
+                "weather": current_weather,
+                "weather_emoji": current_emoji,
+                "wind_speed": self._required_float(current_payload.get("wind_speed")),
             },
             daily=daily_items,
         )
 
     @staticmethod
-    def build_display_name(location: dict) -> str:
-        name = str(location.get("name") or "").strip()
-        country = str(location.get("country") or "").strip()
-        admin1 = str(location.get("admin1") or "").strip()
+    def build_display_name(location: dict, fallback_name: str) -> str:
+        display_name = str(location.get("display_name") or "").strip()
+        if display_name:
+            return display_name
 
+        name = str(location.get("name") or fallback_name).strip() or fallback_name
+        country = str(location.get("country") or "").strip()
         if country and country != name:
             return f"{name}，{country}"
-        if admin1 and admin1 != name:
-            return f"{name}，{admin1}"
-        return name or "未知城市"
+        return name
 
     @staticmethod
-    def build_normalized_key(location: dict) -> str:
-        location_id = location.get("id")
-        if location_id is not None:
-            return f"id:{location_id}"
-
+    def build_normalized_key(location: dict, latitude: float, longitude: float) -> str:
         country_code = str(location.get("country_code") or "XX").upper()
-        latitude = round(float(location["latitude"]), NORMALIZED_COORD_PRECISION)
-        longitude = round(float(location["longitude"]), NORMALIZED_COORD_PRECISION)
+        rounded_latitude = round(float(latitude), NORMALIZED_COORD_PRECISION)
+        rounded_longitude = round(float(longitude), NORMALIZED_COORD_PRECISION)
         return (
             f"{country_code}:"
-            f"{latitude:.{NORMALIZED_COORD_PRECISION}f}:"
-            f"{longitude:.{NORMALIZED_COORD_PRECISION}f}"
+            f"{rounded_latitude:.{NORMALIZED_COORD_PRECISION}f}:"
+            f"{rounded_longitude:.{NORMALIZED_COORD_PRECISION}f}"
         )
 
     @staticmethod
-    def describe_weather_code(code: int | None) -> str:
-        if code is None:
-            return "未知"
-        return WEATHER_CODE_DESCRIPTIONS.get(code, "未知")
+    def normalize_weather(value: object) -> tuple[str, str]:
+        weather_text = str(value or "未知").strip() or "未知"
+        for keywords, normalized in WEATHER_TEXT_ALIASES:
+            if any(keyword in weather_text for keyword in keywords):
+                return normalized
+        return weather_text, "🌤️"
 
     @staticmethod
-    def get_weather_emoji(code: int | None) -> str:
-        if code is None:
-            return "❓"
-        return WEATHER_CODE_EMOJIS.get(code, "🌤️")
+    def _extract_message_content(payload: dict) -> str:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+        return content
+
+    @staticmethod
+    def _strip_code_fence(content: str) -> str:
+        stripped = content.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            if len(lines) >= 3:
+                return "\n".join(lines[1:-1]).strip()
+        return stripped
+
+    @staticmethod
+    def _read_error_body(error: HTTPError) -> str:
+        try:
+            return error.read().decode("utf-8", errors="ignore")
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _require_keys(payload: dict, required_keys: set[str]) -> None:
+        missing = [key for key in required_keys if key not in payload or payload.get(key) in (None, "")]
+        if missing:
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+
+    @staticmethod
+    def _validate_date(value: object) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。") from exc
+        return value
+
+    @staticmethod
+    def _to_float(value: object) -> float:
+        return float(value)
+
+    @staticmethod
+    def _required_float(value: object) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。") from exc
+
+    @staticmethod
+    def _clamp_percentage(value: float) -> float:
+        return max(0.0, min(100.0, value))

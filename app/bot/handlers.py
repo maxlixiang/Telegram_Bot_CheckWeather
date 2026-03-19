@@ -4,7 +4,14 @@ import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update
-from telegram.ext import Application, BaseHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    BaseHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from app.config import load_settings
 from app.db.database import (
@@ -54,9 +61,10 @@ Telegram Weather Bot
 - /start = 开启每日自动天气推送
 - /stop = 关闭每日自动天气推送
 - /settime HH:MM = 设置每日自动推送时间，例如 /settime 08:30
+- 直接发送城市名，例如 北京，也可以查询该城市天气
 
 默认推送时间为 {DEFAULT_PUSH_HOUR:02d}:{DEFAULT_PUSH_MINUTE:02d}，可以通过 /settime HH:MM 修改。
-当前机器人仅服务单用户，只有配置的 TELEGRAM_USER_ID 可以使用 /check、/add、/delete、/list、/start、/stop、/settime。
+当前机器人仅服务单用户，只有配置的 TELEGRAM_USER_ID 可以使用 /check、/add、/delete、/list、/start、/stop、/settime，以及直接发送城市名查询天气。
 """.strip()
 
 
@@ -149,6 +157,29 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines = ["当前城市列表："]
     lines.extend(f"- {city.display_name or city.city_name}" for city in cities)
     await reply_text(update, "\n".join(lines))
+
+
+async def text_weather_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    if not await ensure_authorized(update):
+        return
+
+    city_name = normalize_city_name(update.message.text or "")
+    if not city_name:
+        return
+
+    try:
+        report = build_city_query_weather(city_name)
+    except CityNotFoundError:
+        await reply_text(update, f"未找到城市：{city_name}，请尝试更具体的名称。")
+        return
+    except WeatherServiceError:
+        await reply_text(update, "天气服务暂时不可用，请稍后再试。")
+        return
+
+    await reply_text(update, format_city_weather(report))
 
 
 async def start_push_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -288,8 +319,19 @@ def build_weather_text() -> str | None:
     return format_check_message(reports)
 
 
+def build_city_query_weather(city_name: str) -> CityWeatherResult:
+    settings = load_settings()
+    service = WeatherService()
+    return service.get_weather_for_city_query(city_name, timezone=settings.default_timezone)
+
+
 def prepare_weather_city(service: WeatherService, city: StoredCity) -> StoredCity:
-    if city.latitude is not None and city.longitude is not None:
+    if (
+        city.latitude is not None
+        and city.longitude is not None
+        and city.display_name
+        and city.normalized_key
+    ):
         return city
 
     resolved = service.resolve_city(city.city_name)
@@ -348,7 +390,10 @@ def format_city_weather(report: CityWeatherResult) -> str:
 def format_date(value: str | None) -> str:
     if not value:
         return "--.--"
-    return datetime.strptime(value, "%Y-%m-%d").strftime("%m-%d")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%m-%d")
+    except ValueError:
+        return "--.--"
 
 
 def format_temperature(value: float | int | None) -> str:
@@ -438,4 +483,5 @@ def get_handlers() -> list[BaseHandler]:
         CommandHandler("start", start_push_command),
         CommandHandler("stop", stop_push_command),
         CommandHandler("settime", settime_command),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_weather_query),
     ]

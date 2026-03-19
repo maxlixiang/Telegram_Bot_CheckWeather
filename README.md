@@ -13,13 +13,12 @@
 - `/start`：开启每日自动天气推送
 - `/stop`：关闭每日自动天气推送
 - `/settime HH:MM`：设置每日自动推送时间
+- 直接发送城市名：例如 `北京`，可直接查询该城市天气
 
 ## 本阶段优化
 - `/add` 已升级为更友好的城市去重策略
-- 现在会先做 geocoding，再按稳定的标准地点信息去重
-- 像 `北京`、`beijing`、`Beijing`、`北京市` 这类常见别名，若解析到同一地点，会被识别为同一城市
-- `cities` 表会兼容扩展并保存标准地点信息，旧数据无需删库重建
-- `/check` 与自动推送已升级为更清晰的纯文本天气消息排版
+- 当前天气数据与城市解析改为通过 DeepSeek API 获取
+- `/check`、自动推送、直接发送城市名查询，复用同一套纯文本天气消息排版
 
 ## 环境变量说明
 项目运行依赖 `.env` 文件。可以先复制 `.env.example` 再修改：
@@ -32,6 +31,8 @@ cp .env.example .env
 
 - `TELEGRAM_BOT_TOKEN`：Telegram BotFather 提供的机器人 token
 - `TELEGRAM_USER_ID`：当前机器人唯一允许使用者的 Telegram 数字 user id
+- `DEEPSEEK_API_KEY`：DeepSeek API Key
+- `DEEPSEEK_MODEL`：DeepSeek 模型名，默认 `deepseek-chat`
 - `DEFAULT_TIMEZONE`：默认时区，例如 `Asia/Shanghai`
 - `WEATHER_API_KEY`：当前阶段保留但未实际使用，可先保留占位值
 
@@ -43,7 +44,8 @@ cp .env.example .env
 - `/check`：查询当前已保存城市的天气
 - `/start`：开启每日自动天气推送
 - `/stop`：关闭每日自动天气推送
-- `/settime HH:MM`：设置每日自动天气推送时间，例如 `/settime 08:30`
+- `/settime HH:MM`：设置每日自动推送时间，例如 `/settime 08:30`
+- 直接发送城市名，例如 `北京`：查询该城市当前天气与未来 7 天天气
 
 ## 自动推送时间说明
 - 默认推送时间是 `08:00`
@@ -107,6 +109,6 @@ docker compose logs -f
 ## 排错建议
 1. 先看日志：`docker compose logs -f`
 2. 检查 `.env` 是否存在且内容正确
-3. 检查 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_USER_ID` 是否填写正确
+3. 检查 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_USER_ID`、`DEEPSEEK_API_KEY` 是否填写正确
 4. 确认 VPS 可以正常访问外网
 5. 确认 `data/` 目录挂载正常，程序有权限写入 SQLite 文件
