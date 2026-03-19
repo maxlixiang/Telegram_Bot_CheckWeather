@@ -291,11 +291,9 @@ def build_weather_text() -> str | None:
         try:
             weather_target = prepare_weather_city(service, city)
             reports.append(
-                service.get_weather_for_location(
+                service.get_weather_by_adcode(
                     city_label=weather_target.display_name or weather_target.city_name,
-                    latitude=weather_target.latitude,
-                    longitude=weather_target.longitude,
-                    timezone=settings.default_timezone,
+                    adcode=service.extract_adcode(weather_target.normalized_key),
                 )
             )
         except CityNotFoundError:
@@ -326,12 +324,7 @@ def build_city_query_weather(city_name: str) -> CityWeatherResult:
 
 
 def prepare_weather_city(service: WeatherService, city: StoredCity) -> StoredCity:
-    if (
-        city.latitude is not None
-        and city.longitude is not None
-        and city.display_name
-        and city.normalized_key
-    ):
+    if city.display_name and city.normalized_key:
         return city
 
     resolved = service.resolve_city(city.city_name)
@@ -364,29 +357,27 @@ def format_city_weather(report: CityWeatherResult) -> str:
 
     current = report.current or {}
     daily = report.daily or []
-    logger.info(
-        "Final display date list for %s: %s",
-        report.city,
-        [item.get("date") for item in daily],
-    )
 
     lines = [
         f"📍 {report.city}",
-        (
-            f"{current.get('weather_emoji', '❓')} 当前：{current.get('weather', '未知')}  "
-            f"{format_temperature(current.get('temperature'))}"
-            f"（体感 {format_temperature(current.get('apparent_temperature'))}）"
-        ),
-        f"💨 风速：{format_wind_speed(current.get('wind_speed'))}",
-        "📅 未来 7 天",
+        f"{current.get('weather_emoji', '❓')} 当前：{current.get('weather', '未知')}  {format_temperature(current.get('temperature'))}",
     ]
+
+    wind_text = format_wind(current.get("wind_direction"), current.get("wind_power"))
+    if wind_text:
+        lines.append(f"💨 风向/风力：{wind_text}")
+
+    humidity = current.get("humidity")
+    if humidity:
+        lines.append(f"💧 湿度：{humidity}%")
+
+    lines.append("📅 天气预报")
 
     for item in daily:
         lines.append(
             f"• {format_date(item.get('date'))} "
-            f"{item.get('weather_emoji', '❓')} {item.get('weather', '未知')}  "
-            f"{format_temp_range(item.get('temp_min'), item.get('temp_max'))}  "
-            f"☔ {format_percentage(item.get('precipitation_probability'))}"
+            f"{item.get('day_weather_emoji', item.get('weather_emoji', '❓'))} 白天：{item.get('day_weather', item.get('weather', '未知'))}  {format_temperature(item.get('temp_max'))} / "
+            f"{item.get('night_weather_emoji', '❓')} 夜间：{item.get('night_weather', '未知')}  {format_temperature(item.get('temp_min'))}"
         )
 
     return "\n".join(lines)
@@ -407,20 +398,16 @@ def format_temperature(value: float | int | None) -> str:
     return f"{round(value)}°C"
 
 
-def format_temp_range(temp_min: float | int | None, temp_max: float | int | None) -> str:
-    return f"{format_temperature(temp_min)} ~ {format_temperature(temp_max)}"
-
-
-def format_wind_speed(value: float | int | None) -> str:
-    if value is None:
-        return "--"
-    return f"{round(value)} km/h"
-
-
-def format_percentage(value: float | int | None) -> str:
-    if value is None:
-        return "--"
-    return f"{round(value)}%"
+def format_wind(direction: str | None, power: str | None) -> str:
+    direction_text = (direction or "").strip()
+    power_text = (power or "").strip()
+    if direction_text and power_text:
+        return f"{direction_text}  {power_text}级"
+    if direction_text:
+        return direction_text
+    if power_text:
+        return f"{power_text}级"
+    return ""
 
 
 def get_scheduled_push_time() -> time:

@@ -17,8 +17,9 @@
 
 ## 本阶段优化
 - `/add` 已升级为更友好的城市去重策略
-- 当前天气数据与城市解析改为通过 DeepSeek API 获取
+- 当前天气数据与城市解析改为通过高德 Web 服务 API 获取
 - `/check`、自动推送、直接发送城市名查询，复用同一套纯文本天气消息排版
+- 当前展示为“当前天气 + 天气预报（前 3 天）”
 
 ## 环境变量说明
 项目运行依赖 `.env` 文件。可以先复制 `.env.example` 再修改：
@@ -31,8 +32,8 @@ cp .env.example .env
 
 - `TELEGRAM_BOT_TOKEN`：Telegram BotFather 提供的机器人 token
 - `TELEGRAM_USER_ID`：当前机器人唯一允许使用者的 Telegram 数字 user id
-- `DEEPSEEK_API_KEY`：DeepSeek API Key
-- `DEEPSEEK_MODEL`：DeepSeek 模型名，默认 `deepseek-chat`
+- `AMAP_WEB_API_KEY`：高德 Web 服务 API Key
+- `AMAP_WEB_API_SECRET`：高德 Web 服务安全密钥，用于生成 `sig`，建议填写
 - `DEFAULT_TIMEZONE`：默认时区，例如 `Asia/Shanghai`
 - `WEATHER_API_KEY`：当前阶段保留但未实际使用，可先保留占位值
 
@@ -45,7 +46,7 @@ cp .env.example .env
 - `/start`：开启每日自动天气推送
 - `/stop`：关闭每日自动天气推送
 - `/settime HH:MM`：设置每日自动推送时间，例如 `/settime 08:30`
-- 直接发送城市名，例如 `北京`：查询该城市当前天气与未来 7 天天气
+- 直接发送城市名，例如 `北京`：查询该城市当前天气与天气预报（前 3 天）
 
 ## 自动推送时间说明
 - 默认推送时间是 `08:00`
@@ -109,6 +110,7 @@ docker compose logs -f
 ## 排错建议
 1. 先看日志：`docker compose logs -f`
 2. 检查 `.env` 是否存在且内容正确
-3. 检查 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_USER_ID`、`DEEPSEEK_API_KEY` 是否填写正确
-4. 确认 VPS 可以正常访问外网
-5. 确认 `data/` 目录挂载正常，程序有权限写入 SQLite 文件
+3. 检查 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_USER_ID`、`AMAP_WEB_API_KEY` 是否填写正确
+4. 如果开启了安全密钥校验，检查 `AMAP_WEB_API_SECRET` 是否填写正确
+5. 确认 VPS 可以正常访问外网
+6. 确认 `data/` 目录挂载正常，程序有权限写入 SQLite 文件
