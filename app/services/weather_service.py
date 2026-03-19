@@ -1,10 +1,10 @@
 ﻿from dataclasses import dataclass
 import hashlib
-import json
 import logging
-from urllib.error import HTTPError, URLError
+import time
 from urllib.parse import urlencode
-from urllib.request import urlopen
+
+import httpx
 
 from app.config import load_settings
 
@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 
 AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 AMAP_WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
-REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_TIMEOUT_SECONDS = 25.0
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 1.5
 DISPLAY_FORECAST_DAYS = 3
 MUNICIPALITY_CODES = {"11", "12", "31", "50"}
 DISTRICT_SUFFIXES = ("区", "县", "旗", "镇", "乡", "街道", "新区", "开发区")
@@ -61,6 +63,7 @@ class WeatherService:
         settings = load_settings()
         self.api_key = settings.amap_web_api_key
         self.api_secret = settings.amap_web_api_secret
+        self.timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
 
     def resolve_city(self, city: str) -> ResolvedCity:
         payload = self._request_amap_json(
@@ -125,15 +128,58 @@ class WeatherService:
             request_params["sig"] = self.build_sig(base_url, request_params, self.api_secret)
 
         request_url = f"{base_url}?{urlencode(request_params)}"
-        try:
-            with urlopen(request_url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                payload = json.load(response)
-        except HTTPError as exc:
-            logger.warning("AMap %s HTTP error: %s", request_label, exc.reason)
-            raise WeatherServiceError("天气服务请求失败，请稍后再试。") from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            logger.warning("AMap %s request failed: %s", request_label, exc)
-            raise WeatherServiceError("天气服务请求失败，请稍后再试。") from exc
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with httpx.Client(timeout=self.timeout, http2=False) as client:
+                    response = client.get(request_url)
+                    response.raise_for_status()
+                    payload = response.json()
+                break
+            except httpx.TimeoutException as exc:
+                logger.warning(
+                    "AMap %s timeout on attempt %s/%s: %s",
+                    request_label,
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                )
+            except httpx.NetworkError as exc:
+                logger.warning(
+                    "AMap %s network/SSL error on attempt %s/%s: %s",
+                    request_label,
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                )
+            except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    "AMap %s HTTP status error on attempt %s/%s: status=%s",
+                    request_label,
+                    attempt,
+                    MAX_RETRIES,
+                    exc.response.status_code,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "AMap %s invalid JSON on attempt %s/%s: %s",
+                    request_label,
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                )
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "AMap %s HTTP client error on attempt %s/%s: %s",
+                    request_label,
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                )
+
+            if attempt == MAX_RETRIES:
+                raise WeatherServiceError("天气服务暂时不可用，请稍后再试。")
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
         status = str(payload.get("status") or "")
         info = str(payload.get("info") or "")
@@ -149,6 +195,13 @@ class WeatherService:
         )
 
         if status != "1" or infocode != "10000":
+            logger.warning(
+                "AMap %s business error: status=%s info=%s infocode=%s",
+                request_label,
+                status,
+                info,
+                infocode,
+            )
             raise WeatherServiceError("天气服务暂时不可用，请稍后再试。")
 
         return payload
