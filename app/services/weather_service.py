@@ -1,9 +1,10 @@
 ﻿from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import json
 import logging
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import load_settings
 
@@ -14,6 +15,7 @@ NORMALIZED_COORD_PRECISION = 4
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 REQUEST_TIMEOUT_SECONDS = 20
 QUERY_FORECAST_DAYS = 7
+CHINA_TIMEZONE = "Asia/Shanghai"
 EXPECTED_DAILY_FIELDS = {"date", "weather", "temp_min", "temp_max", "precipitation_probability"}
 EXPECTED_CURRENT_FIELDS = {"weather", "temperature", "apparent_temperature", "wind_speed"}
 WEATHER_TEXT_ALIASES = [
@@ -72,6 +74,7 @@ class WeatherService:
 
     def resolve_city(self, city: str) -> ResolvedCity:
         payload = self._request_model_json(
+            request_label="resolve_city",
             user_prompt=(
                 "请识别用户输入的城市，并返回稳定的地点信息。"
                 "如果无法确定地点，请返回 {\"found\": false, \"reason\": \"...\"}。"
@@ -80,7 +83,7 @@ class WeatherService:
                 "display_name(string)、country_code(string)、latitude(number)、longitude(number)。"
                 "display_name 请优先使用‘城市，中国’这类中文格式。"
                 f"用户输入：{city}"
-            )
+            ),
         )
 
         if not payload.get("found", True):
@@ -113,7 +116,11 @@ class WeatherService:
         longitude: float,
         timezone: str,
     ) -> CityWeatherResult:
+        forecast_timezone = self.resolve_forecast_timezone(city_label, timezone)
+        base_date = self.current_date_in_timezone(forecast_timezone)
+
         payload = self._request_model_json(
+            request_label="weather_forecast",
             user_prompt=(
                 "请根据给定城市和坐标，返回该城市今天到未来 6 天的天气。"
                 "只返回 JSON 对象，禁止输出最终展示文本、解释文字、Markdown 或额外字段说明。"
@@ -122,11 +129,17 @@ class WeatherService:
                 "apparent_temperature(number)、wind_speed(number)。"
                 "daily 每项必须包含：date(YYYY-MM-DD)、weather(string)、"
                 "temp_min(number)、temp_max(number)、precipitation_probability(number 0-100)。"
-                f"城市：{city_label}；纬度：{latitude}；经度：{longitude}；时区：{timezone}。"
-                "daily 要包含今天在内总共 7 天。"
-            )
+                f"城市：{city_label}；纬度：{latitude}；经度：{longitude}；时区：{forecast_timezone}；"
+                f"今天日期：{base_date.isoformat()}。"
+                "daily 要包含今天在内总共 7 天，按天顺序返回。"
+            ),
         )
-        return self._build_city_weather(city=city_label, payload=payload)
+        return self._build_city_weather(
+            city=city_label,
+            payload=payload,
+            base_date=base_date,
+            forecast_timezone=forecast_timezone,
+        )
 
     def get_weather_for_city_query(self, city: str, timezone: str) -> CityWeatherResult:
         resolved = self.resolve_city(city)
@@ -139,7 +152,7 @@ class WeatherService:
         report.city = resolved.display_name
         return report
 
-    def _request_model_json(self, user_prompt: str) -> dict:
+    def _request_model_json(self, request_label: str, user_prompt: str) -> dict:
         if not self.api_key:
             raise WeatherServiceError("未配置 DeepSeek API Key。")
 
@@ -183,6 +196,8 @@ class WeatherService:
             raise WeatherServiceError("天气服务请求失败，请稍后再试。") from exc
 
         content = self._extract_message_content(raw_response)
+        logger.info("DeepSeek raw %s summary: %s", request_label, self.summarize_text(content))
+
         try:
             parsed = json.loads(self._strip_code_fence(content))
         except json.JSONDecodeError as exc:
@@ -193,7 +208,13 @@ class WeatherService:
             raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
         return parsed
 
-    def _build_city_weather(self, city: str, payload: dict) -> CityWeatherResult:
+    def _build_city_weather(
+        self,
+        city: str,
+        payload: dict,
+        base_date: date,
+        forecast_timezone: str,
+    ) -> CityWeatherResult:
         self._require_keys(payload, required_keys={"city", "current", "daily"})
 
         current_payload = payload.get("current")
@@ -204,16 +225,18 @@ class WeatherService:
 
         self._require_keys(current_payload, required_keys=EXPECTED_CURRENT_FIELDS)
 
+        parsed_model_dates: list[str] = []
         daily_items: list[dict] = []
-        for item in daily_payload[:QUERY_FORECAST_DAYS]:
+        for index, item in enumerate(daily_payload[:QUERY_FORECAST_DAYS]):
             if not isinstance(item, dict):
                 raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
             self._require_keys(item, required_keys=EXPECTED_DAILY_FIELDS)
-            date_value = self._validate_date(item.get("date"))
+            parsed_model_dates.append(self.normalize_model_date(item.get("date")))
             weather_text, weather_emoji = self.normalize_weather(item.get("weather"))
+            generated_date = (base_date + timedelta(days=index)).isoformat()
             daily_items.append(
                 {
-                    "date": date_value,
+                    "date": generated_date,
                     "weather": weather_text,
                     "weather_emoji": weather_emoji,
                     "temp_max": self._required_float(item.get("temp_max")),
@@ -226,6 +249,19 @@ class WeatherService:
 
         if len(daily_items) != QUERY_FORECAST_DAYS:
             raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+
+        logger.info(
+            "Parsed DeepSeek daily dates for %s in %s: %s",
+            city,
+            forecast_timezone,
+            parsed_model_dates,
+        )
+        logger.info(
+            "Generated final forecast dates for %s in %s: %s",
+            city,
+            forecast_timezone,
+            [item["date"] for item in daily_items],
+        )
 
         current_weather, current_emoji = self.normalize_weather(current_payload.get("weather"))
         return CityWeatherResult(
@@ -266,12 +302,34 @@ class WeatherService:
         )
 
     @staticmethod
+    def resolve_forecast_timezone(city_label: str, timezone: str) -> str:
+        normalized_timezone = (timezone or "").strip() or "UTC"
+        if "中国" in city_label and normalized_timezone.upper() == "UTC":
+            return CHINA_TIMEZONE
+        return normalized_timezone
+
+    @staticmethod
+    def current_date_in_timezone(timezone: str) -> date:
+        try:
+            return datetime.now(ZoneInfo(timezone)).date()
+        except ZoneInfoNotFoundError:
+            logger.warning("Invalid forecast timezone '%s'. Falling back to UTC.", timezone)
+            return datetime.now(ZoneInfo("UTC")).date()
+
+    @staticmethod
     def normalize_weather(value: object) -> tuple[str, str]:
         weather_text = str(value or "未知").strip() or "未知"
         for keywords, normalized in WEATHER_TEXT_ALIASES:
             if any(keyword in weather_text for keyword in keywords):
                 return normalized
         return weather_text, "🌤️"
+
+    @staticmethod
+    def summarize_text(value: str, limit: int = 240) -> str:
+        compact = " ".join(value.split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
 
     @staticmethod
     def _extract_message_content(payload: dict) -> str:
@@ -308,14 +366,13 @@ class WeatherService:
             raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
 
     @staticmethod
-    def _validate_date(value: object) -> str:
+    def normalize_model_date(value: object) -> str:
         if not isinstance(value, str) or not value.strip():
-            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。")
+            return "<missing>"
         try:
-            datetime.strptime(value, "%Y-%m-%d")
-        except ValueError as exc:
-            raise WeatherServiceError("天气服务返回的数据不完整，请稍后再试。") from exc
-        return value
+            return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            return f"<invalid:{value}>"
 
     @staticmethod
     def _to_float(value: object) -> float:

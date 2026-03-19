@@ -364,6 +364,11 @@ def format_city_weather(report: CityWeatherResult) -> str:
 
     current = report.current or {}
     daily = report.daily or []
+    logger.info(
+        "Final display date list for %s: %s",
+        report.city,
+        [item.get("date") for item in daily],
+    )
 
     lines = [
         f"📍 {report.city}",
